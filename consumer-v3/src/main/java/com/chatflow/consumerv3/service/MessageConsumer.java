@@ -2,16 +2,6 @@ package com.chatflow.consumerv3.service;
 
 import com.chatflow.consumerv3.models.QueueMessage;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import jakarta.annotation.PostConstruct;
-import jakarta.annotation.PreDestroy;
-import java.util.List;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -22,16 +12,27 @@ import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.sqs.SqsClient;
 import software.amazon.awssdk.services.sqs.model.*;
 
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.util.List;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+
 /**
- * Multithreaded consumer that pulls messages from SQS queues
- * and routes them to the broadcaster.
+ * Consumer with database persistence and server broadcast (Assignment 3).
+ * Reads from SQS, writes to DynamoDB, and calls Server API to broadcast.
  */
 @Service
 public class MessageConsumer {
 
   private static final Logger logger = LoggerFactory.getLogger(MessageConsumer.class);
   private static final int MAX_MESSAGES_PER_POLL = 10;
-  private static final int WAIT_TIME_SECONDS = 20; // Long polling
+  private static final int WAIT_TIME_SECONDS = 20;
 
   @Value("${consumer.thread.count:20}")
   private int consumerThreadCount;
@@ -48,35 +49,38 @@ public class MessageConsumer {
   @Value("${sqs.rooms.end:20}")
   private int roomsEnd;
 
-  private final MessageBroadcaster broadcaster;
+  @Value("${server.broadcast.url}")
+  private String serverBroadcastUrl;
+
+  private final DynamoDBService dynamoDBService;
   private final ObjectMapper objectMapper = new ObjectMapper();
+  private final HttpClient httpClient = HttpClient.newBuilder()
+      .connectTimeout(java.time.Duration.ofSeconds(5))
+      .build();
 
   private SqsClient sqsClient;
   private ExecutorService executorService;
   private final AtomicBoolean running = new AtomicBoolean(false);
   private final AtomicLong messagesProcessed = new AtomicLong(0);
-
-  // Simple counters instead of Micrometer metrics
   private final AtomicLong messagesConsumed = new AtomicLong(0);
   private final AtomicLong messagesFailed = new AtomicLong(0);
-  private long totalProcessingTimeNanos = 0;
+  private final AtomicLong broadcastsFailed = new AtomicLong(0);
 
   @Autowired
-  public MessageConsumer(MessageBroadcaster broadcaster) {
-    this.broadcaster = broadcaster;
+  public MessageConsumer(DynamoDBService dynamoDBService) {
+    this.dynamoDBService = dynamoDBService;
   }
 
   @PostConstruct
   public void start() {
     logger.info("Starting Message Consumer with {} threads", consumerThreadCount);
+    logger.info("Server broadcast URL: {}", serverBroadcastUrl);
 
-    // Initialize SQS client
     sqsClient = SqsClient.builder()
         .region(Region.of(awsRegion))
         .credentialsProvider(DefaultCredentialsProvider.create())
         .build();
 
-    // Create a thread pool
     executorService = Executors.newFixedThreadPool(consumerThreadCount,
         new ThreadFactory() {
           private int counter = 0;
@@ -88,7 +92,6 @@ public class MessageConsumer {
 
     running.set(true);
 
-    // Distribute rooms across consumer threads
     List<String> queueUrls = generateQueueUrls();
     int queuesPerThread = (int) Math.ceil((double) queueUrls.size() / consumerThreadCount);
 
@@ -127,13 +130,10 @@ public class MessageConsumer {
       sqsClient.close();
     }
 
-    logger.info("Message Consumer stopped. Total messages processed: {}",
-        messagesProcessed.get());
+    logger.info("Message Consumer stopped. Processed: {}, Failed: {}, Broadcast Failures: {}",
+        messagesProcessed.get(), messagesFailed.get(), broadcastsFailed.get());
   }
 
-  /**
-   * Generates queue URLs for all rooms
-   */
   private List<String> generateQueueUrls() {
     List<String> urls = new CopyOnWriteArrayList<>();
     for (int i = roomsStart; i <= roomsEnd; i++) {
@@ -142,9 +142,6 @@ public class MessageConsumer {
     return urls;
   }
 
-  /**
-   * Consumer task that polls specific queues
-   */
   private class ConsumerTask implements Runnable {
     private final List<String> queueUrls;
 
@@ -162,7 +159,6 @@ public class MessageConsumer {
             pollAndProcess(queueUrl);
           } catch (Exception e) {
             logger.error("Error polling queue {}: {}", queueUrl, e.getMessage());
-            // Continue to the next queue
           }
         }
       }
@@ -170,9 +166,6 @@ public class MessageConsumer {
       logger.info("Consumer task stopped for queues: {}", queueUrls);
     }
 
-    /**
-     * Polls a queue and processes messages
-     */
     private void pollAndProcess(String queueUrl) {
       try {
         ReceiveMessageRequest receiveRequest = ReceiveMessageRequest.builder()
@@ -196,29 +189,32 @@ public class MessageConsumer {
 
       } catch (QueueDoesNotExistException e) {
         logger.error("Queue does not exist: {}", queueUrl);
-        running.set(false); // Stop if the queue doesn't exist
+        running.set(false);
       } catch (Exception e) {
         logger.error("Error receiving messages from {}: {}", queueUrl, e.getMessage());
       }
     }
 
-    /**
-     * Processes a single message
-     */
     private void processMessage(String queueUrl, Message message) {
       long startTime = System.nanoTime();
 
       try {
-        // Parse message body
         QueueMessage queueMessage = objectMapper.readValue(
             message.body(), QueueMessage.class);
 
-        // Broadcast to room
-        boolean broadcasted = broadcaster.broadcastToRoom(
-            queueMessage.getRoomId(), queueMessage);
+        // STEP 1: Write to DynamoDB (async, non-blocking)
+        boolean dbQueued = dynamoDBService.queueMessageForWrite(queueMessage);
+
+        if (!dbQueued) {
+          logger.warn("Failed to queue message {} for DB write",
+              queueMessage.getMessageId());
+        }
+
+        // STEP 2: Call Server to broadcast (synchronous but fast)
+        boolean broadcasted = notifyServerToBroadcast(queueMessage);
 
         if (broadcasted) {
-          // Acknowledge message
+          // Success - delete from queue
           deleteMessage(queueUrl, message.receiptHandle());
           messagesConsumed.incrementAndGet();
           messagesProcessed.incrementAndGet();
@@ -226,10 +222,11 @@ public class MessageConsumer {
           logger.debug("Processed message {} for room {}",
               queueMessage.getMessageId(), queueMessage.getRoomId());
         } else {
-          // Broadcast failed; a message will be retried
-          messagesFailed.incrementAndGet();
-          logger.warn("Failed to broadcast message {} to room {}",
-              queueMessage.getMessageId(), queueMessage.getRoomId());
+          // Broadcast failed but don't fail the entire operation
+          // Message will be retried based on SQS visibility timeout
+          broadcastsFailed.incrementAndGet();
+          logger.warn("Failed to broadcast message {}, will retry",
+              queueMessage.getMessageId());
         }
 
       } catch (Exception e) {
@@ -237,13 +234,51 @@ public class MessageConsumer {
         logger.error("Error processing message from {}: {}", queueUrl, e.getMessage());
       } finally {
         long endTime = System.nanoTime();
-        totalProcessingTimeNanos += (endTime - startTime);
+        long processingTime = (endTime - startTime) / 1_000_000;
+        if (processingTime > 100) {
+          logger.warn("Slow message processing: {}ms", processingTime);
+        }
       }
     }
 
     /**
-     * Deletes a message from the queue
+     * Notify Server to broadcast message to room via HTTP API
      */
+    private boolean notifyServerToBroadcast(QueueMessage queueMessage) {
+      try {
+        String requestBody = objectMapper.writeValueAsString(queueMessage);
+
+        HttpRequest request = HttpRequest.newBuilder()
+            .uri(URI.create(serverBroadcastUrl))
+            .header("Content-Type", "application/json")
+            .POST(HttpRequest.BodyPublishers.ofString(requestBody))
+            .timeout(java.time.Duration.ofSeconds(5))
+            .build();
+
+        HttpResponse<String> response = httpClient.send(request,
+            HttpResponse.BodyHandlers.ofString());
+
+        if (response.statusCode() == 200) {
+          logger.debug("Server broadcast successful for message {}",
+              queueMessage.getMessageId());
+          return true;
+        } else {
+          logger.warn("Server broadcast API returned status {} for message {}: {}",
+              response.statusCode(), queueMessage.getMessageId(), response.body());
+          return false;
+        }
+
+      } catch (java.net.ConnectException e) {
+        logger.error("Cannot connect to server broadcast API at {}: {}",
+            serverBroadcastUrl, e.getMessage());
+        return false;
+      } catch (Exception e) {
+        logger.error("Failed to call server broadcast API for message {}: {}",
+            queueMessage.getMessageId(), e.getMessage());
+        return false;
+      }
+    }
+
     private void deleteMessage(String queueUrl, String receiptHandle) {
       try {
         DeleteMessageRequest deleteRequest = DeleteMessageRequest.builder()
@@ -258,11 +293,9 @@ public class MessageConsumer {
     }
   }
 
-  /**
-   * Gets consumer statistics
-   */
   public String getStats() {
-    return String.format("Running: %s, Threads: %d, Messages processed: %d",
-        running.get(), consumerThreadCount, messagesProcessed.get());
+    return String.format("Running: %s, Processed: %d, Failed: %d, Broadcast Failures: %d, DB Buffer: %d",
+        running.get(), messagesProcessed.get(), messagesFailed.get(),
+        broadcastsFailed.get(), dynamoDBService.getBufferSize());
   }
 }
